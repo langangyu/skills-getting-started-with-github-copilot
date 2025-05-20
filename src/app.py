@@ -10,18 +10,27 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from pymongo import MongoClient
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# MongoDB Atlas connection
+client = MongoClient(os.getenv('MONGODB_URI'))
+db = client['high_school']
+activities_collection = db['activities']
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-# Add more activities: 2 sports, 2 artistic, 2 intellectual
-activities = {
+# Initialize database with default activities if empty
+default_activities = {
     "Soccer Team": {
         "description": "Join the school soccer team and compete in local leagues",
         "schedule": "Wednesdays and Fridays, 4:00 PM - 5:30 PM",
@@ -78,6 +87,11 @@ activities = {
     }
 }
 
+# Check if activities collection is empty and initialize if needed
+if activities_collection.count_documents({}) == 0:
+    for name, details in default_activities.items():
+        activities_collection.insert_one({"name": name, **details})
+
 
 @app.get("/")
 def root():
@@ -86,45 +100,57 @@ def root():
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    activities_list = activities_collection.find({}, {'_id': 0})
+    return {activity.pop("name"): activity for activity in activities_list}
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = activities_collection.find_one({"name": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specificy activity
-    activity = activities[activity_name]
-
-    #validate studuent is not already signed up
+    # Check if student is already signed up
     if email in activity["participants"]:
         raise HTTPException(status_code=400, detail="Already signed up for this activity")
-    # Validate max participants
+
+    # Check if activity is full
     if len(activity["participants"]) >= activity["max_participants"]:
         raise HTTPException(status_code=400, detail="Activity is full")
-    # Validate email format
-    if "@" not in email or "." not in email.split("@")[-1]:
-        raise HTTPException(status_code=400, detail="Invalid email format")
-    # Validate email domain
-    if not email.endswith("@mergington.edu"):
-        raise HTTPException(status_code=400, detail="Email must be from mergington.edu")
-    # Validate email is not empty
-    if not email:
-        raise HTTPException(status_code=400, detail="Email cannot be empty")
-    # Validate email is not too long
-    if len(email) > 50:
-        raise HTTPException(status_code=400, detail="Email is too long")
-    # Validate email is not too short
-    if len(email) < 5:
-        raise HTTPException(status_code=400, detail="Email is too short")
-    # Validate email is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(status_code=400, detail="Already signed up for this activity")
-    
 
-    # Add student
-    activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+    # Add student to activity
+    result = activities_collection.update_one(
+        {"name": activity_name},
+        {"$push": {"participants": email}}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to sign up")
+
+    return {"message": f"Successfully signed up for {activity_name}"}
+
+
+@app.delete("/activities/{activity_name}/remove")
+def remove_from_activity(activity_name: str, email: str):
+    """Remove a student from an activity"""
+    # Validate activity exists
+    activity = activities_collection.find_one({"name": activity_name})
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Check if student is signed up
+    if email not in activity["participants"]:
+        raise HTTPException(status_code=400, detail="Not signed up for this activity")
+
+    # Remove student from activity
+    result = activities_collection.update_one(
+        {"name": activity_name},
+        {"$pull": {"participants": email}}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to remove participant")
+
+    return {"message": f"Successfully removed from {activity_name}"}
